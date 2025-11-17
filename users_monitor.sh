@@ -1,7 +1,8 @@
 #!/bin/bash
 
-# Скрипт автоматического контроля времени и подписок Xray
-# Для архитектуры: single-port (443) с массивом clients
+# Скрипт автоматического контроля времени Xray (Single-Port Architecture)
+# Работает с единым портом 443, все пользователи в clients array
+# Удаление происходит ПО ИМЕНИ для безопасности
 
 # Цвета
 RED='\033[0;31m'
@@ -12,11 +13,11 @@ CYAN='\033[0;36m'
 MAGENTA='\033[0;35m'
 NC='\033[0m'
 
-# Конфигурация
-CONFIG_FILE="/usr/local/etc/xray/config.json"
-LOG_FILE="/var/log/xray_auto_cleanup.log"
+# Конфигурация по умолчанию
 DEFAULT_TIME_LIMIT_HOURS=24
-DEFAULT_CHECK_INTERVAL=60
+DEFAULT_CHECK_INTERVAL=3600  # 1 час в секундах
+LOG_FILE="/var/log/xray_time_control.log"
+CONFIG_FILE="/usr/local/etc/xray/config.json"
 
 # Функция логирования
 log_message() {
@@ -25,10 +26,11 @@ log_message() {
     echo "[$timestamp] $message" | tee -a "$LOG_FILE"
 }
 
-# Функция для вычисления возраста пользователя в часах
+# Функция для вычисления времени жизни пользователя в часах
 get_user_age_hours() {
     local created_date="$1"
     
+    # Преобразуем дату создания в timestamp
     local created_timestamp=$(date -d "$created_date" +%s 2>/dev/null)
     
     if [ -z "$created_timestamp" ] || [ "$created_timestamp" = "" ]; then
@@ -36,65 +38,89 @@ get_user_age_hours() {
         return 1
     fi
     
+    # Текущий timestamp
     local current_timestamp=$(date +%s)
+    
+    # Разница в секундах
     local diff_seconds=$((current_timestamp - created_timestamp))
+    
+    # Конвертируем в часы
     local hours=$(echo "scale=2; $diff_seconds / 3600" | bc)
     
     echo "$hours"
 }
 
-# Функция удаления пользователя по индексу (защита main - индекс 0)
-remove_user_by_index() {
-    local user_index=$1
-    local user_num=$((user_index + 1))
-    local age_hours=$2
-    local time_limit=$3
+# Функция для удаления пользователя ПО ИМЕНИ
+remove_user_by_name() {
+    local user_email="$1"
+    local age_hours="$2"
+    local time_limit="$3"
     
-    # Защита главного пользователя (первый в массиве)
-    if [[ $user_index -eq 0 ]]; then
-        log_message "WARNING: Attempt to remove protected user #1 (main) - BLOCKED"
-        echo -e "${RED}❌ Нельзя удалить защищенного пользователя #1 (main)${NC}"
+    echo -e "${YELLOW}⚠️  Пользователь '$user_email': Истёк срок действия${NC}"
+    echo -e "    Прошло: ${age_hours}h / Лимит: ${time_limit}h"
+    log_message "WARNING: User '$user_email' - Time expired: ${age_hours}h / ${time_limit}h"
+    
+    # Защита главного пользователя
+    if [[ "$user_email" == "main" ]]; then
+        echo -e "${RED}❌ Нельзя удалить главного пользователя 'main'!${NC}"
+        log_message "ERROR: Attempted to remove protected user 'main'"
         return 1
     fi
     
-    echo -e "${YELLOW}⚠️  Пользователь #$user_num: Истёк срок действия${NC}"
-    echo -e "    Прошло: ${age_hours}h / Лимит: ${time_limit}h"
-    log_message "WARNING: User #$user_num - Time expired: ${age_hours}h / ${time_limit}h"
+    echo -e "${RED}🗑️  Удаление пользователя '$user_email'...${NC}"
+    log_message "ACTION: Removing user '$user_email'"
     
-    echo -e "${RED}🗑️  Удаление пользователя #$user_num...${NC}"
-    log_message "ACTION: Removing user #$user_num"
+    # Проверяем существование пользователя перед удалением
+    local user_exists=$(jq -r --arg email "$user_email" '.inbounds[0].settings.clients[] | select(.email == $email) | .email' "$CONFIG_FILE")
     
-    # Удаляем из config.json по индексу
-    jq "del(.inbounds[0].settings.clients[$user_index])" \
-       "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+    if [[ -z "$user_exists" ]]; then
+        echo -e "${RED}❌ Пользователь '$user_email' не найден в конфигурации${NC}"
+        log_message "ERROR: User '$user_email' not found in config"
+        return 1
+    fi
+    
+    # Удаляем пользователя ПО EMAIL через jq
+    jq --arg email "$user_email" \
+       '.inbounds[0].settings.clients |= map(select(.email != $email))' \
+       "$CONFIG_FILE" > "${CONFIG_FILE}.tmp"
     
     if [ $? -eq 0 ]; then
+        mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
         systemctl restart xray
-        echo -e "${GREEN}✅ Пользователь #$user_num успешно удалён${NC}"
-        log_message "SUCCESS: User #$user_num removed - Time expired"
         
-        # Отправить уведомление (если настроено)
-        send_notification "🗑️ Удалён пользователь #$user_num" "Причина: истёк срок\nПрошло: ${age_hours}h / Лимит: ${time_limit}h"
-        
-        return 0
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}✅ Пользователь '$user_email' успешно удалён${NC}"
+            log_message "SUCCESS: User '$user_email' removed successfully - Time expired"
+            
+            # Отправить уведомление (если настроено)
+            send_notification "🗑️ Удалён пользователь: $user_email" "Причина: истёк срок действия\nПрошло: ${age_hours}h / Лимит: ${time_limit}h"
+            
+            return 0
+        else
+            echo -e "${RED}❌ Ошибка при перезапуске Xray${NC}"
+            log_message "ERROR: Failed to restart Xray after removing '$user_email'"
+            return 1
+        fi
     else
-        echo -e "${RED}❌ Ошибка при удалении пользователя #$user_num${NC}"
-        log_message "ERROR: Failed to remove user #$user_num"
+        echo -e "${RED}❌ Ошибка при удалении пользователя '$user_email'${NC}"
+        log_message "ERROR: Failed to remove user '$user_email' from config"
+        rm -f "${CONFIG_FILE}.tmp"
         return 1
     fi
 }
 
-# Функция отправки уведомлений
+# Функция для отправки уведомлений (опционально)
 send_notification() {
     local title="$1"
     local message="$2"
     
+    # Telegram уведомление (если настроено)
     if [ -f /etc/xray/telegram.conf ]; then
         source /etc/xray/telegram.conf
         if [ -n "$BOT_TOKEN" ] && [ -n "$CHAT_ID" ]; then
             curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
                 -d chat_id="${CHAT_ID}" \
-                -d text="$title"$'\n'"$message" \
+                -d text="$title\n$message" \
                 &>/dev/null
         fi
     fi
@@ -107,13 +133,14 @@ monitor_users() {
     
     echo -e "${CYAN}╔════════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║           🔍 АВТОМАТИЧЕСКИЙ КОНТРОЛЬ ВРЕМЕНИ XRAY              ║${NC}"
+    echo -e "${CYAN}║              (Single-Port Architecture)                        ║${NC}"
     echo -e "${CYAN}╚════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     echo -e "${YELLOW}⚙️  Настройки:${NC}"
     echo -e "   Лимит времени (без подписки): ${GREEN}${time_limit_hours} часов${NC}"
     echo -e "   Интервал проверки: ${GREEN}${check_interval} секунд${NC}"
-    echo -e "   Конфигурация: ${BLUE}${CONFIG_FILE}${NC}"
     echo -e "   Лог файл: ${BLUE}${LOG_FILE}${NC}"
+    echo -e "   Порт: ${CYAN}443${NC} (общий для всех пользователей)"
     echo ""
     echo -e "${YELLOW}📝 Запуск мониторинга... (Ctrl+C для остановки)${NC}"
     echo ""
@@ -130,25 +157,23 @@ monitor_users() {
         echo -e "${CYAN}🔍 Проверка #${check_count} - ${current_time}${NC}"
         echo ""
         
-        # Получаем количество клиентов
-        local total_clients=$(jq '.inbounds[0].settings.clients | length' "$CONFIG_FILE")
+        # Получаем список пользователей из clients array
+        local clients=$(jq -c '.inbounds[0].settings.clients[]' "$CONFIG_FILE")
         
-        if [ "$total_clients" -eq 0 ]; then
+        if [[ -z "$clients" ]]; then
             echo -e "${YELLOW}⚠️  Нет активных пользователей${NC}"
             log_message "INFO: No active users found"
         else
             local users_checked=0
             local users_removed=0
             
-            # Проходим по клиентам в обратном порядке (чтобы индексы не сбивались при удалении)
-            for ((i=$total_clients-1; i>=0; i--)); do
-                local user_num=$((i + 1))
+            # Проверяем каждого пользователя
+            while IFS= read -r client; do
+                local email=$(echo "$client" | jq -r '.email')
+                local subscription=$(echo "$client" | jq -r '.metadata.subscription // "n/a"')
+                local created_date=$(echo "$client" | jq -r '.metadata.created_date // "n/a"')
                 
-                # Получаем метаданные
-                local subscription=$(jq -r ".inbounds[0].settings.clients[$i].metadata.subscription // \"n/a\"" "$CONFIG_FILE")
-                local created_date=$(jq -r ".inbounds[0].settings.clients[$i].metadata.created_date // \"n/a\"" "$CONFIG_FILE")
-                
-                # Получаем возраст
+                # Получаем возраст пользователя в часах
                 local age_hours="0"
                 if [ "$created_date" != "n/a" ]; then
                     age_hours=$(get_user_age_hours "$created_date")
@@ -156,33 +181,29 @@ monitor_users() {
                 
                 local should_remove=false
                 
-                # Проверка: удаляем только пользователей без подписки с истекшим временем
-                if [ "$subscription" = "n" ] && [ "$created_date" != "n/a" ] && [ $i -ne 0 ]; then
+                # Проверка: Истечение времени для пользователей без подписки
+                if [ "$subscription" = "n" ] && [ "$created_date" != "n/a" ]; then
                     if (( $(echo "$age_hours >= $time_limit_hours" | bc -l) )); then
                         should_remove=true
                     fi
                 fi
                 
+                # Удаляем пользователя если нужно
                 if [ "$should_remove" = true ]; then
                     users_removed=$((users_removed + 1))
-                    echo -e "${RED}❌ Пользователь #$user_num${NC}"
+                    echo -e "${RED}❌ $email (порт 443)${NC}"
                     echo -e "   Подписка: $subscription | Создан: $created_date"
                     echo -e "   Возраст: ${age_hours}h / Лимит: ${time_limit_hours}h"
                     
-                    remove_user_by_index "$i" "$age_hours" "$time_limit_hours"
+                    remove_user_by_name "$email" "$age_hours" "$time_limit_hours"
                     
-                    # После удаления обновляем счетчик
-                    total_clients=$(jq '.inbounds[0].settings.clients | length' "$CONFIG_FILE")
+                    # После удаления обновляем список клиентов
+                    clients=$(jq -c '.inbounds[0].settings.clients[]' "$CONFIG_FILE")
                     
                     echo ""
                 else
                     # Пользователь в норме
                     local time_status=""
-                    local protected=""
-                    
-                    if [ $i -eq 0 ]; then
-                        protected=" ${GREEN}[MAIN]${NC}"
-                    fi
                     
                     if [ "$subscription" = "n" ] && [ "$created_date" != "n/a" ]; then
                         local time_percent=$(echo "scale=1; $age_hours * 100 / $time_limit_hours" | bc)
@@ -194,12 +215,12 @@ monitor_users() {
                         time_status="Подписка: n/a | Дата создания: отсутствует"
                     fi
                     
-                    echo -e "${GREEN}✓${NC} Пользователь #$user_num$protected"
+                    echo -e "${GREEN}✓${NC} $email (порт 443)"
                     echo -e "   $time_status"
                 fi
                 
                 users_checked=$((users_checked + 1))
-            done
+            done <<< "$clients"
             
             echo ""
             echo -e "${CYAN}📊 Статистика проверки:${NC}"
@@ -228,28 +249,28 @@ check_once() {
     echo -e "${CYAN}╚════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     echo -e "${YELLOW}Лимит времени (без подписки): ${time_limit_hours} часов${NC}"
+    echo -e "${YELLOW}Порт: 443 (общий для всех пользователей)${NC}"
     echo ""
     
-    local total_clients=$(jq '.inbounds[0].settings.clients | length' "$CONFIG_FILE")
+    local clients=$(jq -c '.inbounds[0].settings.clients[]' "$CONFIG_FILE")
     
-    if [ "$total_clients" -eq 0 ]; then
+    if [[ -z "$clients" ]]; then
         echo -e "${YELLOW}⚠️  Нет активных пользователей${NC}"
         return 0
     fi
     
-    printf "${BLUE}%-8s${NC} ${YELLOW}%-12s${NC} ${CYAN}%-20s${NC} ${MAGENTA}%-15s${NC} ${WHITE}%-10s${NC}\n" \
-        "#" "Подписка" "Дата создания" "Возраст" "Статус"
-    echo "────────────────────────────────────────────────────────────────────────"
+    printf "${BLUE}%-5s${NC} ${GREEN}%-20s${NC} ${CYAN}%-12s${NC} ${MAGENTA}%-15s${NC} ${WHITE}%-10s${NC}\n" \
+        "#" "Пользователь" "Подписка" "Возраст" "Статус"
+    echo "────────────────────────────────────────────────────────────────────────────────"
     
     local total_to_remove=0
     declare -a users_to_remove=()
+    local user_number=1
     
-    for ((i=0; i<$total_clients; i++)); do
-        local user_num=$((i + 1))
-        
-        # Получаем метаданные
-        local subscription=$(jq -r ".inbounds[0].settings.clients[$i].metadata.subscription // \"n/a\"" "$CONFIG_FILE")
-        local created_date=$(jq -r ".inbounds[0].settings.clients[$i].metadata.created_date // \"n/a\"" "$CONFIG_FILE")
+    while IFS= read -r client; do
+        local email=$(echo "$client" | jq -r '.email')
+        local subscription=$(echo "$client" | jq -r '.metadata.subscription // "n/a"')
+        local created_date=$(echo "$client" | jq -r '.metadata.created_date // "n/a"')
         
         # Получаем возраст
         local age_hours="0"
@@ -259,14 +280,9 @@ check_once() {
         
         local should_remove=false
         local status="OK"
-        local protected=""
-        
-        if [ $i -eq 0 ]; then
-            protected=" [MAIN]"
-        fi
         
         # Проверяем условия
-        if [ "$subscription" = "n" ] && [ "$created_date" != "n/a" ] && [ $i -ne 0 ]; then
+        if [ "$subscription" = "n" ] && [ "$created_date" != "n/a" ]; then
             if (( $(echo "$age_hours >= $time_limit_hours" | bc -l) )); then
                 should_remove=true
                 status="${RED}ИСТЁК${NC}"
@@ -282,19 +298,21 @@ check_once() {
         
         # Форматируем вывод
         if [ "$should_remove" = true ]; then
-            printf "%-8s %-12s %-20s ${RED}%-15s${NC} %b\n" \
-                "#$user_num" "$subscription" "$created_date" "${age_hours}h" "$status"
+            printf "%-5s %-20s %-12s ${RED}%-15s${NC} %b\n" \
+                "$user_number" "$email" "$subscription" "${age_hours}h" "$status"
             total_to_remove=$((total_to_remove + 1))
-            users_to_remove+=("$i|$age_hours")
+            users_to_remove+=("$email|$age_hours")
         else
             local age_display="${age_hours}h"
             if [ "$subscription" = "y" ]; then
                 age_display="${age_hours}h (∞)"
             fi
-            printf "%-8s %-12s %-20s %-15s %b%s\n" \
-                "#$user_num" "$subscription" "$created_date" "$age_display" "$status" "$protected"
+            printf "%-5s %-20s %-12s %-15s %b\n" \
+                "$user_number" "$email" "$subscription" "$age_display" "$status"
         fi
-    done
+        
+        user_number=$((user_number + 1))
+    done <<< "$clients"
     
     echo ""
     if [ $total_to_remove -gt 0 ]; then
@@ -303,22 +321,22 @@ check_once() {
         
         read -p "Удалить пользователей с истёкшим сроком? (y/n): " confirm
         if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-            # Удаляем в обратном порядке
-            for ((idx=${#users_to_remove[@]}-1; idx>=0; idx--)); do
-                IFS='|' read -r user_index user_age <<< "${users_to_remove[$idx]}"
-                remove_user_by_index "$user_index" "$user_age" "$time_limit_hours"
+            for item in "${users_to_remove[@]}"; do
+                IFS='|' read -r user_email user_age <<< "$item"
+                remove_user_by_name "$user_email" "$user_age" "$time_limit_hours"
                 echo ""
             done
+            
             echo -e "${GREEN}✅ Удаление завершено${NC}"
         else
-            echo -e "${YELLOW}Отменено${NC}"
+            echo -e "${YELLOW}Удаление отменено${NC}"
         fi
     else
         echo -e "${GREEN}✅ Все пользователи в пределах лимита времени${NC}"
     fi
 }
 
-# Функция просмотра статуса
+# Функция просмотра статуса всех пользователей
 show_status() {
     local time_limit_hours=$1
     
@@ -327,23 +345,25 @@ show_status() {
     echo -e "${CYAN}╚════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     echo -e "${YELLOW}Лимит времени (без подписки): ${time_limit_hours} часов${NC}"
+    echo -e "${YELLOW}Порт: 443 (общий для всех пользователей)${NC}"
     echo ""
     
-    local total_clients=$(jq '.inbounds[0].settings.clients | length' "$CONFIG_FILE")
+    local clients=$(jq -c '.inbounds[0].settings.clients[]' "$CONFIG_FILE")
     
-    if [ "$total_clients" -eq 0 ]; then
+    if [[ -z "$clients" ]]; then
         echo -e "${YELLOW}⚠️  Нет активных пользователей${NC}"
         return 0
     fi
     
-    echo "════════════════════════════════════════════════════════════════════"
+    echo "════════════════════════════════════════════════════════════════════════════════"
     
-    for ((i=0; i<$total_clients; i++)); do
-        local user_num=$((i + 1))
-        
-        # Получаем метаданные
-        local subscription=$(jq -r ".inbounds[0].settings.clients[$i].metadata.subscription // \"n/a\"" "$CONFIG_FILE")
-        local created_date=$(jq -r ".inbounds[0].settings.clients[$i].metadata.created_date // \"n/a\"" "$CONFIG_FILE")
+    local user_number=1
+    
+    while IFS= read -r client; do
+        local email=$(echo "$client" | jq -r '.email')
+        local subscription=$(echo "$client" | jq -r '.metadata.subscription // "n/a"')
+        local created_date=$(echo "$client" | jq -r '.metadata.created_date // "n/a"')
+        local uuid=$(echo "$client" | jq -r '.id')
         
         # Получаем возраст
         local age_hours="0"
@@ -351,12 +371,9 @@ show_status() {
             age_hours=$(get_user_age_hours "$created_date")
         fi
         
-        local protected=""
-        if [ $i -eq 0 ]; then
-            protected=" ${GREEN}[MAIN - ЗАЩИЩЕН]${NC}"
-        fi
-        
-        echo -e "${CYAN}Пользователь #$user_num$protected${NC}"
+        echo -e "${CYAN}[$user_number] $email${NC}"
+        echo "   Порт: 443 (общий)"
+        echo "   UUID: $uuid"
         echo "   Подписка: $subscription"
         echo "   Создан: $created_date"
         
@@ -366,11 +383,7 @@ show_status() {
             
             if (( $(echo "$age_hours >= $time_limit_hours" | bc -l) )); then
                 echo -e "   Возраст: ${RED}${age_hours}h${NC} (${percent}%)"
-                if [ $i -eq 0 ]; then
-                    echo -e "   Статус: ${GREEN}ЗАЩИЩЕН${NC}"
-                else
-                    echo -e "   Статус: ${RED}ИСТЁК СРОК${NC}"
-                fi
+                echo -e "   Статус: ${RED}ИСТЁК СРОК${NC}"
             else
                 echo -e "   Возраст: ${GREEN}${age_hours}h${NC} из ${time_limit_hours}h (${percent}%)"
                 echo -e "   Осталось: ${GREEN}${remaining}h${NC}"
@@ -384,8 +397,10 @@ show_status() {
             echo -e "   Статус: ${YELLOW}N/A${NC}"
         fi
         
-        echo "────────────────────────────────────────────────────────────────────"
-    done
+        echo "────────────────────────────────────────────────────────────────────────────────"
+        
+        user_number=$((user_number + 1))
+    done <<< "$clients"
 }
 
 # Функция просмотра логов
@@ -415,7 +430,7 @@ show_logs() {
     done
 }
 
-# Функция настройки Telegram
+# Функция настройки Telegram уведомлений
 setup_telegram() {
     echo -e "${CYAN}╔════════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║              📱 НАСТРОЙКА TELEGRAM УВЕДОМЛЕНИЙ                ║${NC}"
@@ -436,11 +451,12 @@ EOF
     echo -e "${GREEN}✅ Telegram уведомления настроены${NC}"
     echo ""
     
+    # Тестовое уведомление
     read -p "Отправить тестовое уведомление? (y/n): " test
     if [ "$test" = "y" ]; then
         curl -s -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" \
             -d chat_id="${chat_id}" \
-            -d text="✅ Xray Auto Cleanup: Тестовое уведомление" \
+            -d text="✅ Xray Time Control: Тестовое уведомление" \
             &>/dev/null
         echo -e "${GREEN}✅ Тестовое сообщение отправлено${NC}"
     fi
@@ -450,36 +466,38 @@ EOF
 show_menu() {
     echo ""
     echo -e "${CYAN}╔════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║        🛡️  АВТОУДАЛЕНИЕ ПОЛЬЗОВАТЕЛЕЙ БЕЗ ПОДПИСКИ           ║${NC}"
+    echo -e "${CYAN}║           🛡️  АВТОМАТИЧЕСКИЙ КОНТРОЛЬ ВРЕМЕНИ XRAY            ║${NC}"
+    echo -e "${CYAN}║              (Single-Port Architecture)                        ║${NC}"
     echo -e "${CYAN}╚════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     echo " 1) 🔄 Запустить мониторинг (непрерывный)"
-    echo " 2) 🔍 Проверить сейчас (одноразово)"
+    echo " 2) 🔍 Проверить сейчас (одноразово с удалением)"
     echo " 3) 📊 Показать статус всех пользователей"
     echo " 4) 📜 Показать логи"
     echo " 5) 📱 Настроить Telegram уведомления"
+    echo " 6) ⚙️  Изменить настройки по умолчанию"
     echo " 0) ❌ Выход"
     echo ""
     read -p "Выберите действие: " choice
     
     case $choice in
         1)
-            read -p "Лимит времени (часов, по умолчанию $DEFAULT_TIME_LIMIT_HOURS): " time_limit
+            read -p "Лимит времени для пользователей без подписки в часах (по умолчанию $DEFAULT_TIME_LIMIT_HOURS): " time_limit
             time_limit=${time_limit:-$DEFAULT_TIME_LIMIT_HOURS}
             
-            read -p "Интервал проверки (секунд, по умолчанию $DEFAULT_CHECK_INTERVAL): " interval
+            read -p "Интервал проверки в секундах (по умолчанию $DEFAULT_CHECK_INTERVAL): " interval
             interval=${interval:-$DEFAULT_CHECK_INTERVAL}
             
             monitor_users "$time_limit" "$interval"
             ;;
         2)
-            read -p "Лимит времени (часов, по умолчанию $DEFAULT_TIME_LIMIT_HOURS): " time_limit
+            read -p "Лимит времени для пользователей без подписки в часах (по умолчанию $DEFAULT_TIME_LIMIT_HOURS): " time_limit
             time_limit=${time_limit:-$DEFAULT_TIME_LIMIT_HOURS}
             
             check_once "$time_limit"
             ;;
         3)
-            read -p "Лимит времени для справки (часов, по умолчанию $DEFAULT_TIME_LIMIT_HOURS): " time_limit
+            read -p "Лимит времени для справки в часах (по умолчанию $DEFAULT_TIME_LIMIT_HOURS): " time_limit
             time_limit=${time_limit:-$DEFAULT_TIME_LIMIT_HOURS}
             
             show_status "$time_limit"
@@ -491,6 +509,25 @@ show_menu() {
             ;;
         5)
             setup_telegram
+            ;;
+        6)
+            echo ""
+            read -p "Лимит времени по умолчанию в часах ($DEFAULT_TIME_LIMIT_HOURS): " new_time_limit
+            new_time_limit=${new_time_limit:-$DEFAULT_TIME_LIMIT_HOURS}
+            
+            read -p "Интервал проверки по умолчанию в секундах ($DEFAULT_CHECK_INTERVAL): " new_interval
+            new_interval=${new_interval:-$DEFAULT_CHECK_INTERVAL}
+            
+            # Сохраняем в конфиг
+            mkdir -p /etc/xray
+            cat > /etc/xray/time_control.conf << EOF
+DEFAULT_TIME_LIMIT_HOURS=$new_time_limit
+DEFAULT_CHECK_INTERVAL=$new_interval
+EOF
+            
+            echo -e "${GREEN}✅ Настройки сохранены${NC}"
+            DEFAULT_TIME_LIMIT_HOURS=$new_time_limit
+            DEFAULT_CHECK_INTERVAL=$new_interval
             ;;
         0)
             exit 0
@@ -513,7 +550,7 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# Проверка зависимостей
+# Проверка наличия необходимых утилит
 if ! command -v jq &> /dev/null; then
     echo -e "${RED}Ошибка: jq не установлен. Установите: apt install jq${NC}"
     exit 1
@@ -524,13 +561,18 @@ if ! command -v bc &> /dev/null; then
     apt-get update && apt-get install -y bc
 fi
 
-# Проверка конфига
+# Проверка наличия конфигурации Xray
 if [ ! -f "$CONFIG_FILE" ]; then
-    echo -e "${RED}Ошибка: конфиг не найден: $CONFIG_FILE${NC}"
+    echo -e "${RED}Ошибка: файл конфигурации Xray не найден: $CONFIG_FILE${NC}"
     exit 1
 fi
 
-# Запуск с аргументами или меню
+# Загрузить конфиг если есть
+if [ -f /etc/xray/time_control.conf ]; then
+    source /etc/xray/time_control.conf
+fi
+
+# Если запущен с аргументами
 if [ $# -gt 0 ]; then
     case "$1" in
         monitor|watch|start)
@@ -550,42 +592,26 @@ if [ $# -gt 0 ]; then
             lines=${2:-20}
             show_logs "$lines"
             ;;
-        telegram)
+        telegram|setup-telegram)
             setup_telegram
             ;;
         *)
             echo "Использование: $0 [monitor|check|status|logs|telegram] [параметры]"
             echo ""
             echo "Примеры:"
-            echo "  $0 monitor 24 60      - мониторинг: лимит 24ч, проверка каждые 60 сек"
+            echo "  $0 monitor 24 3600    - мониторинг: лимит 24ч, проверка каждые 3600 сек (1 час)"
+            echo "  $0 monitor 0.5 1800   - мониторинг: лимит 30 минут, проверка каждые 30 минут"
+            echo "  $0 monitor 0.1 600    - мониторинг: лимит 6 минут, проверка каждые 10 минут"
             echo "  $0 check 12           - проверить: лимит 12ч"
             echo "  $0 status 24          - показать статус с лимитом 24ч"
             echo "  $0 logs 50            - показать 50 последних строк лога"
+            echo "  $0 telegram           - настроить Telegram"
+            echo ""
+            echo "Без аргументов запускается интерактивное меню"
             exit 1
             ;;
     esac
 else
+    # Интерактивное меню
     show_menu
 fi
-```
-
-**Основные изменения:**
-
-1. ❌ **Убрал все упоминания `email`** - работаю с индексами
-2. 🛡️ **Защита пользователя #1** (индекс 0) - это main
-3. 📍 **Удаление по индексу** - `jq "del(.inbounds[0].settings.clients[$i])"`
-4. 🔄 **Обратный порядок проверки** - чтобы индексы не сбивались
-5. 📊 **Отображение "Пользователь #N"** вместо email
-
-**Примеры вывода:**
-```
-✓ Пользователь #1 [MAIN]
-   Подписка: активна (∞)
-
-✓ Пользователь #2
-   Возраст: 12.5h / 24h (52%) | Осталось: 11.5h
-
-❌ Пользователь #3
-   Подписка: n | Создан: 2024-11-15 10:00:00
-   Возраст: 25.2h / Лимит: 24h
-🗑️  Удаление пользователя #3...

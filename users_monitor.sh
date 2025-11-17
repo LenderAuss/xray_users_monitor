@@ -93,7 +93,7 @@ remove_user_by_name() {
     
     if [ $? -eq 0 ]; then
         mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
-        systemctl restart xray
+        systemctl reload xray
         
         if [ $? -eq 0 ]; then
             log_message "SUCCESS: User '$user_email' removed successfully - Time expired"

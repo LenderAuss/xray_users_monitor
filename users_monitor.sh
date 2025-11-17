@@ -19,11 +19,23 @@ DEFAULT_CHECK_INTERVAL=3600  # 1 час в секундах
 LOG_FILE="/var/log/xray_time_control.log"
 CONFIG_FILE="/usr/local/etc/xray/config.json"
 
+# Функция для очистки экрана и возврата курсора
+clear_screen() {
+    # Очищаем экран и возвращаем курсор в начало
+    clear
+}
+
+# Функция для подсчета строк вывода (для динамического обновления)
+count_output_lines() {
+    local count="$1"
+    echo "$count"
+}
+
 # Функция логирования
 log_message() {
     local message="$1"
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$timestamp] $message" | tee -a "$LOG_FILE"
+    echo "[$timestamp] $message" >> "$LOG_FILE"
 }
 
 # Функция для вычисления времени жизни пользователя в часах
@@ -56,25 +68,20 @@ remove_user_by_name() {
     local age_hours="$2"
     local time_limit="$3"
     
-    echo -e "${YELLOW}⚠️  Пользователь '$user_email': Истёк срок действия${NC}"
-    echo -e "    Прошло: ${age_hours}h / Лимит: ${time_limit}h"
     log_message "WARNING: User '$user_email' - Time expired: ${age_hours}h / ${time_limit}h"
     
     # Защита главного пользователя
     if [[ "$user_email" == "main" ]]; then
-        echo -e "${RED}❌ Нельзя удалить главного пользователя 'main'!${NC}"
         log_message "ERROR: Attempted to remove protected user 'main'"
         return 1
     fi
     
-    echo -e "${RED}🗑️  Удаление пользователя '$user_email'...${NC}"
     log_message "ACTION: Removing user '$user_email'"
     
     # Проверяем существование пользователя перед удалением
     local user_exists=$(jq -r --arg email "$user_email" '.inbounds[0].settings.clients[] | select(.email == $email) | .email' "$CONFIG_FILE")
     
     if [[ -z "$user_exists" ]]; then
-        echo -e "${RED}❌ Пользователь '$user_email' не найден в конфигурации${NC}"
         log_message "ERROR: User '$user_email' not found in config"
         return 1
     fi
@@ -89,7 +96,6 @@ remove_user_by_name() {
         systemctl restart xray
         
         if [ $? -eq 0 ]; then
-            echo -e "${GREEN}✅ Пользователь '$user_email' успешно удалён${NC}"
             log_message "SUCCESS: User '$user_email' removed successfully - Time expired"
             
             # Отправить уведомление (если настроено)
@@ -97,12 +103,10 @@ remove_user_by_name() {
             
             return 0
         else
-            echo -e "${RED}❌ Ошибка при перезапуске Xray${NC}"
             log_message "ERROR: Failed to restart Xray after removing '$user_email'"
             return 1
         fi
     else
-        echo -e "${RED}❌ Ошибка при удалении пользователя '$user_email'${NC}"
         log_message "ERROR: Failed to remove user '$user_email' from config"
         rm -f "${CONFIG_FILE}.tmp"
         return 1
@@ -126,24 +130,10 @@ send_notification() {
     fi
 }
 
-# Функция мониторинга
+# Функция мониторинга с динамическим обновлением
 monitor_users() {
     local time_limit_hours=$1
     local check_interval=$2
-    
-    echo -e "${CYAN}╔════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║           🔍 АВТОМАТИЧЕСКИЙ КОНТРОЛЬ ВРЕМЕНИ XRAY              ║${NC}"
-    echo -e "${CYAN}║              (Single-Port Architecture)                        ║${NC}"
-    echo -e "${CYAN}╚════════════════════════════════════════════════════════════════╝${NC}"
-    echo ""
-    echo -e "${YELLOW}⚙️  Настройки:${NC}"
-    echo -e "   Лимит времени (без подписки): ${GREEN}${time_limit_hours} часов${NC}"
-    echo -e "   Интервал проверки: ${GREEN}${check_interval} секунд${NC}"
-    echo -e "   Лог файл: ${BLUE}${LOG_FILE}${NC}"
-    echo -e "   Порт: ${CYAN}443${NC} (общий для всех пользователей)"
-    echo ""
-    echo -e "${YELLOW}📝 Запуск мониторинга... (Ctrl+C для остановки)${NC}"
-    echo ""
     
     log_message "=== Monitoring started. Time limit: ${time_limit_hours}h, Interval: ${check_interval}s ==="
     
@@ -151,6 +141,22 @@ monitor_users() {
     
     while true; do
         check_count=$((check_count + 1))
+        
+        # Очищаем экран для обновления
+        clear_screen
+        
+        # Заголовок
+        echo -e "${CYAN}╔════════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${CYAN}║           🔍 АВТОМАТИЧЕСКИЙ КОНТРОЛЬ ВРЕМЕНИ XRAY              ║${NC}"
+        echo -e "${CYAN}║              (Single-Port Architecture)                        ║${NC}"
+        echo -e "${CYAN}╚════════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "${YELLOW}⚙️  Настройки:${NC}"
+        echo -e "   Лимит времени (без подписки): ${GREEN}${time_limit_hours} часов${NC}"
+        echo -e "   Интервал проверки: ${GREEN}${check_interval} секунд${NC}"
+        echo -e "   Лог файл: ${BLUE}${LOG_FILE}${NC}"
+        echo -e "   Порт: ${CYAN}443${NC} (общий для всех пользователей)"
+        echo ""
         
         local current_time=$(date '+%Y-%m-%d %H:%M:%S')
         echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -166,6 +172,7 @@ monitor_users() {
         else
             local users_checked=0
             local users_removed=0
+            local users_ok=0
             
             # Проверяем каждого пользователя
             while IFS= read -r client; do
@@ -191,50 +198,50 @@ monitor_users() {
                 # Удаляем пользователя если нужно
                 if [ "$should_remove" = true ]; then
                     users_removed=$((users_removed + 1))
-                    echo -e "${RED}❌ $email (порт 443)${NC}"
+                    echo -e "${RED}❌ УДАЛЕНИЕ: $email${NC}"
                     echo -e "   Подписка: $subscription | Создан: $created_date"
                     echo -e "   Возраст: ${age_hours}h / Лимит: ${time_limit_hours}h"
+                    echo ""
                     
                     remove_user_by_name "$email" "$age_hours" "$time_limit_hours"
                     
                     # После удаления обновляем список клиентов
                     clients=$(jq -c '.inbounds[0].settings.clients[]' "$CONFIG_FILE")
-                    
-                    echo ""
                 else
-                    # Пользователь в норме
+                    users_ok=$((users_ok + 1))
+                    # Пользователь в норме - краткий вывод
                     local time_status=""
                     
                     if [ "$subscription" = "n" ] && [ "$created_date" != "n/a" ]; then
                         local time_percent=$(echo "scale=1; $age_hours * 100 / $time_limit_hours" | bc)
                         local remaining=$(echo "scale=2; $time_limit_hours - $age_hours" | bc)
-                        time_status="Возраст: ${age_hours}h / ${time_limit_hours}h (${time_percent}%) | Осталось: ${remaining}h"
+                        time_status="${age_hours}h/${time_limit_hours}h (${time_percent}%) | Осталось: ${remaining}h"
                     elif [ "$subscription" = "y" ]; then
                         time_status="Подписка: активна (∞)"
                     else
-                        time_status="Подписка: n/a | Дата создания: отсутствует"
+                        time_status="N/A"
                     fi
                     
-                    echo -e "${GREEN}✓${NC} $email (порт 443)"
-                    echo -e "   $time_status"
+                    echo -e "${GREEN}✓${NC} $email | $time_status"
                 fi
                 
                 users_checked=$((users_checked + 1))
             done <<< "$clients"
             
             echo ""
-            echo -e "${CYAN}📊 Статистика проверки:${NC}"
-            echo -e "   Проверено пользователей: ${users_checked}"
+            echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+            echo -e "${CYAN}📊 Статистика:${NC}"
+            echo -e "   Всего пользователей: ${CYAN}${users_checked}${NC}"
+            echo -e "   В норме: ${GREEN}${users_ok}${NC}"
             if [ $users_removed -gt 0 ]; then
-                echo -e "   Удалено: ${RED}${users_removed}${NC}"
+                echo -e "   Удалено за эту проверку: ${RED}${users_removed}${NC}"
             else
-                echo -e "   Удалено: ${GREEN}0${NC}"
+                echo -e "   Удалено за эту проверку: ${GREEN}0${NC}"
             fi
         fi
         
         echo ""
-        echo -e "${BLUE}⏳ Следующая проверка через ${check_interval} секунд...${NC}"
-        echo ""
+        echo -e "${BLUE}⏳ Следующая проверка через ${check_interval} секунд... (Ctrl+C для остановки)${NC}"
         
         sleep "$check_interval"
     done
@@ -323,10 +330,11 @@ check_once() {
         if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
             for item in "${users_to_remove[@]}"; do
                 IFS='|' read -r user_email user_age <<< "$item"
+                echo -e "${RED}🗑️  Удаление: $user_email...${NC}"
                 remove_user_by_name "$user_email" "$user_age" "$time_limit_hours"
-                echo ""
             done
             
+            echo ""
             echo -e "${GREEN}✅ Удаление завершено${NC}"
         else
             echo -e "${YELLOW}Удаление отменено${NC}"
